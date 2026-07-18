@@ -550,10 +550,9 @@ impl TerminalState {
     fn should_ignore_detected_state_under_full_lifecycle_hook(
         &self,
         detected_agent: Option<Agent>,
-        process_exited: bool,
+        _process_exited: bool,
     ) -> bool {
         self.live_full_lifecycle_hook_authority()
-            && !process_exited
             && !self.hook_authority_conflicts_with_detected_agent(detected_agent)
     }
 
@@ -1679,6 +1678,19 @@ mod tests {
         assert_eq!(terminal.fallback_state, AgentState::Idle);
         assert_eq!(terminal.state, AgentState::Working);
         assert!(change.is_none());
+
+        let change = terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Omp),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+
+        assert!(change.is_none());
+        assert_eq!(terminal.state, AgentState::Working);
     }
 
     #[test]
