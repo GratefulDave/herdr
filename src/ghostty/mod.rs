@@ -74,6 +74,13 @@ pub enum Dirty {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalCompressionResult {
+    Unsupported,
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowSelection {
     pub start_x: u16,
     pub end_x: u16,
@@ -119,6 +126,21 @@ impl FocusEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    Light,
+    Dark,
+}
+
+impl ColorScheme {
+    fn as_raw(self) -> ffi::GhosttyColorScheme {
+        match self {
+            Self::Light => ffi::GhosttyColorScheme_GHOSTTY_COLOR_SCHEME_LIGHT,
+            Self::Dark => ffi::GhosttyColorScheme_GHOSTTY_COLOR_SCHEME_DARK,
+        }
+    }
+}
+
 pub const MOD_SHIFT: u16 = ffi::GHOSTTY_MODS_SHIFT as u16;
 pub const MOD_CTRL: u16 = ffi::GHOSTTY_MODS_CTRL as u16;
 pub const MOD_ALT: u16 = ffi::GHOSTTY_MODS_ALT as u16;
@@ -153,6 +175,8 @@ pub const MOUSE_BUTTON_WHEEL_RIGHT: ffi::GhosttyMouseButton =
     ffi::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_SEVEN;
 pub const MOUSE_FORMAT_SGR: ffi::GhosttyMouseFormat =
     ffi::GhosttyMouseFormat_GHOSTTY_MOUSE_FORMAT_SGR;
+pub const MOUSE_FORMAT_SGR_PIXELS: ffi::GhosttyMouseFormat =
+    ffi::GhosttyMouseFormat_GHOSTTY_MOUSE_FORMAT_SGR_PIXELS;
 
 pub const MODE_APPLICATION_CURSOR_KEYS: u16 = 1;
 pub const MODE_FOCUS_EVENT: u16 = 1004;
@@ -163,6 +187,7 @@ pub const MODE_MOUSE_SGR_PIXELS: u16 = 1016;
 pub const MODE_BRACKETED_PASTE: u16 = 2004;
 pub const MODE_SYNCHRONIZED_OUTPUT: u16 = 2026;
 pub const MODE_GRAPHEME_CLUSTER: u16 = 2027;
+pub const MODE_COLOR_SCHEME_REPORT: u16 = 2031;
 // These are documented in vendor/libghostty-vt/include/ghostty/vt/terminal.h,
 // but the generated bindings do not currently expose named constants for them.
 const TERMINAL_DATA_COLOR_FOREGROUND: ffi::GhosttyTerminalData = 18;
@@ -337,6 +362,12 @@ impl From<ffi::GhosttyColorRgb> for RgbColor {
     }
 }
 
+pub fn default_palette() -> [RgbColor; 256] {
+    let mut palette = [ffi::GhosttyColorRgb::default(); 256];
+    unsafe { ffi::ghostty_color_palette_default(palette.as_mut_ptr()) };
+    palette.map(Into::into)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellColor {
     Palette(u8),
@@ -443,10 +474,62 @@ impl CellWide {
 
 type WritePtyCallback = dyn FnMut(&[u8]) + Send;
 
+const MAX_CLIPBOARD_BYTES: usize = 192 * 1024;
+
 #[derive(Default)]
 struct TerminalCallbackState {
     write_pty: Option<Box<WritePtyCallback>>,
+    bell_count: u16,
     pwd_changes: Vec<Vec<u8>>,
+    clipboard_writes: Vec<Vec<u8>>,
+    size_report: ffi::GhosttySizeReportSize,
+    color_scheme: Option<ColorScheme>,
+}
+
+unsafe extern "C" fn bell_trampoline(_terminal: ffi::GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
+    let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
+    state.bell_count = state.bell_count.saturating_add(1);
+}
+
+unsafe extern "C" fn color_scheme_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    out_scheme: *mut ffi::GhosttyColorScheme,
+) -> bool {
+    if userdata.is_null() || out_scheme.is_null() {
+        return false;
+    }
+    let state = unsafe { &*userdata.cast::<TerminalCallbackState>() };
+    let Some(color_scheme) = state.color_scheme else {
+        return false;
+    };
+    unsafe {
+        out_scheme.write(color_scheme.as_raw());
+    }
+    true
+}
+
+unsafe extern "C" fn size_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    out_size: *mut ffi::GhosttySizeReportSize,
+) -> bool {
+    if userdata.is_null() || out_size.is_null() {
+        return false;
+    }
+    let state = unsafe { &*userdata.cast::<TerminalCallbackState>() };
+    let size = state.size_report;
+    if size.rows == 0 || size.columns == 0 || size.cell_width == 0 || size.cell_height == 0 {
+        return false;
+    }
+    unsafe {
+        out_size.write(size);
+    }
+    true
 }
 
 unsafe extern "C" fn write_pty_trampoline(
@@ -468,6 +551,89 @@ unsafe extern "C" fn write_pty_trampoline(
         unsafe { slice::from_raw_parts(data, len) }
     };
     callback(bytes);
+}
+
+unsafe extern "C" fn clipboard_write_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    write: *const ffi::GhosttyClipboardWrite,
+) -> ffi::GhosttyClipboardWriteResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: libghostty-vt owns these values for the synchronous callback.
+        unsafe { capture_clipboard_write(userdata, write) }
+    }))
+    .unwrap_or(ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA)
+}
+
+unsafe fn capture_clipboard_write(
+    userdata: *mut c_void,
+    write: *const ffi::GhosttyClipboardWrite,
+) -> ffi::GhosttyClipboardWriteResult {
+    if userdata.is_null() || write.is_null() {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    }
+
+    let required_size = std::mem::offset_of!(ffi::GhosttyClipboardWrite, contents_len)
+        + std::mem::size_of::<usize>();
+    // SAFETY: size is the leading field of the live request.
+    if unsafe { (*write).size } < required_size {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    }
+    // SAFETY: the size check covers every field accessed below.
+    let request = unsafe { &*write };
+    if request.location != ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+    }
+
+    // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
+    let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
+    if request.contents_len == 0 {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+    }
+    if request.contents_len != 1 {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+    }
+    if request.contents.is_null() {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    }
+
+    // SAFETY: libghostty-vt keeps the single content and its strings alive for the callback.
+    let content = unsafe { &*request.contents };
+    // SAFETY: the MIME string is borrowed from the live callback request.
+    let Some(mime) = (unsafe { borrowed_bytes(content.mime) }) else {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    };
+    let is_text = std::str::from_utf8(mime)
+        .ok()
+        .and_then(|mime| mime.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"));
+    if !is_text {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+    }
+
+    // SAFETY: the data string is borrowed from the live callback request.
+    let Some(bytes) = (unsafe { borrowed_bytes(content.data) }) else {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    };
+    if bytes.is_empty() {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+    }
+    if bytes.len() > MAX_CLIPBOARD_BYTES {
+        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+    }
+    state.clipboard_writes.push(bytes.to_vec());
+    ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
+}
+
+unsafe fn borrowed_bytes<'a>(value: ffi::GhosttyString) -> Option<&'a [u8]> {
+    if value.len == 0 {
+        Some(&[])
+    } else if value.ptr.is_null() {
+        None
+    } else {
+        // SAFETY: the callback contract keeps pointer and length valid until return.
+        Some(unsafe { slice::from_raw_parts(value.ptr, value.len) })
+    }
 }
 
 unsafe extern "C" fn pwd_changed_trampoline(terminal: ffi::GhosttyTerminal, userdata: *mut c_void) {
@@ -621,6 +787,9 @@ pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
 
 pub struct Terminal {
     raw: ffi::GhosttyTerminal,
+    max_scrollback: usize,
+    #[cfg(windows)]
+    tracked_row: ffi::GhosttyTrackedGridRef,
     callback_state: Box<TerminalCallbackState>,
     kitty_fingerprints: Mutex<HashMap<u32, KittyImageFingerprintEntry>>,
     kitty_empty_generation: Cell<Option<u64>>,
@@ -641,7 +810,17 @@ impl Terminal {
 
         let mut terminal = Self {
             raw,
-            callback_state: Box::default(),
+            max_scrollback,
+            #[cfg(windows)]
+            tracked_row: ptr::null_mut(),
+            callback_state: Box::new(TerminalCallbackState {
+                size_report: ffi::GhosttySizeReportSize {
+                    rows,
+                    columns: cols,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             kitty_fingerprints: Mutex::new(HashMap::new()),
             kitty_empty_generation: Cell::new(None),
         };
@@ -656,8 +835,32 @@ impl Terminal {
             .into_result()?;
             ffi::ghostty_terminal_set(
                 terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SIZE,
+                (size_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_BELL,
+                (bell_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PWD_CHANGED,
                 (pwd_changed_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+                (clipboard_write_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
+                (color_scheme_trampoline as *const ()).cast(),
             )
             .into_result()?;
             ffi::ghostty_terminal_set(
@@ -677,6 +880,72 @@ impl Terminal {
         }
     }
 
+    pub(crate) fn compression_activity(&self) -> Result<u64, Error> {
+        let mut activity = 0;
+        // SAFETY: self.raw is a live terminal handle and activity is a valid out pointer.
+        unsafe {
+            ffi::ghostty_terminal_compression_activity(self.raw, &mut activity).into_result()?;
+        }
+        Ok(activity)
+    }
+
+    pub(crate) fn compress_incremental(&mut self) -> Result<TerminalCompressionResult, Error> {
+        let mut result =
+            ffi::GhosttyTerminalCompressionResult_GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED;
+        // SAFETY: self.raw is a live terminal handle and result is a valid out pointer.
+        unsafe {
+            ffi::ghostty_terminal_compress(
+                self.raw,
+                ffi::GhosttyTerminalCompressionMode_GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL,
+                &mut result,
+            )
+            .into_result()?;
+        }
+        match result {
+            ffi::GhosttyTerminalCompressionResult_GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED => {
+                Ok(TerminalCompressionResult::Unsupported)
+            }
+            ffi::GhosttyTerminalCompressionResult_GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING => {
+                Ok(TerminalCompressionResult::Pending)
+            }
+            ffi::GhosttyTerminalCompressionResult_GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE => {
+                Ok(TerminalCompressionResult::Complete)
+            }
+            _ => Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE)),
+        }
+    }
+
+    pub fn set_default_palette(&mut self, palette: &[RgbColor; 256]) -> Result<(), Error> {
+        let palette = palette.map(|color| ffi::GhosttyColorRgb {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        });
+        unsafe {
+            ffi::ghostty_terminal_set(
+                self.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_PALETTE,
+                palette.as_ptr().cast(),
+            )
+            .into_result()
+        }
+    }
+
+    pub fn default_palette(&self) -> Result<[RgbColor; 256], Error> {
+        let mut out = [ffi::GhosttyColorRgb::default(); 256];
+        // SAFETY: self.raw is a live terminal handle, and out is exactly the
+        // 256-entry array this data kind writes.
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.raw,
+                ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT,
+                out.as_mut_ptr().cast(),
+            )
+            .into_result()?;
+        }
+        Ok(out.map(Into::into))
+    }
+
     pub fn resize(
         &mut self,
         cols: u16,
@@ -684,13 +953,25 @@ impl Terminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Result<(), Error> {
-        let cell_width_px = cell_width_px.max(1);
-        let cell_height_px = cell_height_px.max(1);
+        let size_report = ffi::GhosttySizeReportSize {
+            rows,
+            columns: cols,
+            cell_width: cell_width_px,
+            cell_height: cell_height_px,
+        };
         // SAFETY: self.raw is valid and sizes are plain values.
         unsafe {
-            ffi::ghostty_terminal_resize(self.raw, cols, rows, cell_width_px, cell_height_px)
-                .into_result()
+            ffi::ghostty_terminal_resize(
+                self.raw,
+                cols,
+                rows,
+                cell_width_px.max(1),
+                cell_height_px.max(1),
+            )
+            .into_result()?;
         }
+        self.callback_state.size_report = size_report;
+        Ok(())
     }
 
     pub fn enable_kitty_graphics(&mut self) -> Result<(), Error> {
@@ -754,8 +1035,20 @@ impl Terminal {
         Ok(())
     }
 
+    pub fn set_color_scheme(&mut self, color_scheme: Option<ColorScheme>) -> Option<ColorScheme> {
+        mem::replace(&mut self.callback_state.color_scheme, color_scheme)
+    }
+
+    pub fn take_bell_count(&mut self) -> u16 {
+        mem::take(&mut self.callback_state.bell_count)
+    }
+
     pub fn take_pwd_changes(&mut self) -> Vec<Vec<u8>> {
         mem::take(&mut self.callback_state.pwd_changes)
+    }
+
+    pub fn take_clipboard_writes(&mut self) -> Vec<Vec<u8>> {
+        mem::take(&mut self.callback_state.clipboard_writes)
     }
 
     pub fn mode_get(&self, mode: u16) -> Result<bool, Error> {
@@ -785,6 +1078,10 @@ impl Terminal {
         self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING)
     }
 
+    pub fn modify_other_keys_enabled(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MODIFY_OTHER_KEYS)
+    }
+
     pub fn active_screen(&self) -> Result<ActiveScreen, Error> {
         let mut out = ffi::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY;
         unsafe {
@@ -810,6 +1107,10 @@ impl Terminal {
         self.get_usize(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)
     }
 
+    pub fn max_scrollback(&self) -> usize {
+        self.max_scrollback
+    }
+
     pub fn scrollbar(&self) -> Result<TerminalScrollbar, Error> {
         let mut out = ffi::GhosttyTerminalScrollbar::default();
         unsafe {
@@ -825,6 +1126,22 @@ impl Terminal {
             offset: out.offset as usize,
             len: out.len as usize,
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn track_row(&mut self, y: u32) -> Option<usize> {
+        let mut point = ffi::GhosttyPointCoordinate::default();
+        let tag = ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN;
+        let result =
+            unsafe { ffi::ghostty_tracked_grid_ref_point(self.tracked_row, tag, &mut point) };
+        let terminal = self.raw;
+        let target = ghostty_viewport_point(0, y);
+        unsafe {
+            ffi::ghostty_tracked_grid_ref_free(self.tracked_row);
+            self.tracked_row = ptr::null_mut();
+            let _ = ffi::ghostty_terminal_grid_ref_track(terminal, target, &mut self.tracked_row);
+        }
+        (result == ffi::GhosttyResult_GHOSTTY_SUCCESS).then_some(point.y as usize)
     }
 
     pub fn screen_cell(&self, x: u16, y: u32) -> Result<(CellWide, Vec<u32>), Error> {
@@ -1139,6 +1456,10 @@ impl Terminal {
         self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_ROWS)
     }
 
+    pub fn cursor_y(&self) -> Result<u16, Error> {
+        self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_Y)
+    }
+
     pub fn effective_foreground_color(&self) -> Result<Option<RgbColor>, Error> {
         self.get_optional_rgb_color(TERMINAL_DATA_COLOR_FOREGROUND)
     }
@@ -1147,11 +1468,11 @@ impl Terminal {
         self.get_optional_rgb_color(TERMINAL_DATA_COLOR_CURSOR)
     }
 
-    fn width_px(&self) -> Result<u32, Error> {
+    pub(crate) fn width_px(&self) -> Result<u32, Error> {
         self.get_u32(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_WIDTH_PX)
     }
 
-    fn height_px(&self) -> Result<u32, Error> {
+    pub(crate) fn height_px(&self) -> Result<u32, Error> {
         self.get_u32(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_HEIGHT_PX)
     }
 
@@ -1611,6 +1932,8 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         // SAFETY: freeing a null or live handle is allowed by the C API.
         unsafe {
+            #[cfg(windows)]
+            ffi::ghostty_tracked_grid_ref_free(self.tracked_row);
             ffi::ghostty_terminal_free(self.raw);
         }
     }
@@ -3025,6 +3348,38 @@ mod tests {
     }
 
     #[test]
+    fn incremental_compression_preserves_cold_scrollback() {
+        let mut terminal = Terminal::new(80, 24, 20_000_000).unwrap();
+        let initial_activity = terminal.compression_activity().unwrap();
+        let suffix = "x".repeat(66);
+        for line in 1..=10_000 {
+            terminal.write(format!("{line:05} {suffix}\r\n").as_bytes());
+        }
+        assert_ne!(terminal.compression_activity().unwrap(), initial_activity);
+
+        let mut complete = false;
+        for _ in 0..10_000 {
+            match terminal.compress_incremental().unwrap() {
+                TerminalCompressionResult::Unsupported => return,
+                TerminalCompressionResult::Pending => {}
+                TerminalCompressionResult::Complete => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete, "incremental compression did not converge");
+
+        let oldest = terminal.read_text_screen((0, 0), (79, 0), false).unwrap();
+        assert!(oldest.starts_with("00001 "));
+        let last_row = terminal.total_rows().unwrap() as u32 - 1;
+        let newest = terminal
+            .read_text_screen((0, last_row - 1), (79, last_row), false)
+            .unwrap();
+        assert!(newest.contains("10000"));
+    }
+
+    #[test]
     fn kitty_image_fingerprint_covers_full_payload() {
         let mut data = vec![1u8; 4096 * 4];
         let original =
@@ -3217,6 +3572,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn kitty_graphics_file_upload_can_be_placed_later() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-kitty-file-upload-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pixel.rgba");
+        std::fs::write(&path, [255, 0, 0, 255]).unwrap();
+
+        let mut terminal = Terminal::new(10, 5, 0).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        terminal.resize(10, 5, 8, 16).unwrap();
+        let mut upload = Vec::new();
+        crate::kitty_graphics::encode_kitty_regular_file(
+            &mut upload,
+            &[],
+            "a=t,f=32,s=1,v=1,i=10,q=0",
+            path.to_str().unwrap(),
+        );
+        terminal.write(&upload);
+        assert!(terminal.kitty_image_placements().unwrap().is_empty());
+
+        terminal.write(b"\x1b_Ga=p,i=10,p=5,c=10,r=5,C=1,q=2\x1b\\");
+        let placements = terminal.kitty_image_placements().unwrap();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].image_id, 10);
+        assert_eq!(placements[0].placement_id, 5);
+        assert_eq!(placements[0].image_width, 1);
+        assert_eq!(placements[0].image_height, 1);
+        assert_eq!(placements[0].format, KittyImageFormat::Rgba);
+        assert_eq!(placements[0].data, [255, 0, 0, 255]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn kitty_graphics_unicode_placeholder_placement_is_queryable() {
         let mut terminal = Terminal::new(10, 5, 0).unwrap();
@@ -3325,6 +3717,17 @@ mod tests {
         mouse_event.set_position(0.0, 0.0);
         let encoded_mouse = mouse_encoder.encode(&mouse_event).unwrap();
         assert_eq!(encoded_mouse, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn modify_other_keys_query_tracks_mode_two() {
+        let mut terminal = Terminal::new(80, 24, 0).unwrap();
+
+        assert!(!terminal.modify_other_keys_enabled().unwrap());
+        terminal.write(b"\x1b[>4;2m");
+        assert!(terminal.modify_other_keys_enabled().unwrap());
+        terminal.write(b"\x1b[>4;0m");
+        assert!(!terminal.modify_other_keys_enabled().unwrap());
     }
 
     #[test]
@@ -3638,6 +4041,98 @@ mod tests {
             .unwrap();
         assert!(rows.next());
         assert_eq!(rows.selection().unwrap(), None);
+    }
+
+    fn test_clipboard_content(mime: &[u8], data: &[u8]) -> ffi::GhosttyClipboardContent {
+        ffi::GhosttyClipboardContent {
+            mime: ffi::GhosttyString {
+                ptr: mime.as_ptr(),
+                len: mime.len(),
+            },
+            data: ffi::GhosttyString {
+                ptr: data.as_ptr(),
+                len: data.len(),
+            },
+        }
+    }
+
+    fn invoke_clipboard_callback(
+        terminal: &mut Terminal,
+        contents: &[ffi::GhosttyClipboardContent],
+        size: usize,
+    ) -> ffi::GhosttyClipboardWriteResult {
+        let request = ffi::GhosttyClipboardWrite {
+            size,
+            location: ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+            contents: contents.as_ptr(),
+            contents_len: contents.len(),
+        };
+        // SAFETY: the request and its borrowed content live through this call.
+        unsafe {
+            clipboard_write_trampoline(
+                terminal.raw,
+                (&mut *terminal.callback_state as *mut TerminalCallbackState).cast(),
+                &request,
+            )
+        }
+    }
+
+    #[test]
+    fn clipboard_callback_ignores_clear_and_rejects_unsupported_writes() {
+        let mut terminal = Terminal::new(10, 5, 0).unwrap();
+        let full_size = std::mem::size_of::<ffi::GhosttyClipboardWrite>();
+        let success = ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+        let unsupported =
+            ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+        let invalid = ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
+
+        assert_eq!(
+            invoke_clipboard_callback(&mut terminal, &[], full_size),
+            success
+        );
+        assert!(terminal.take_clipboard_writes().is_empty());
+
+        let empty = test_clipboard_content(b"text/plain", b"");
+        assert_eq!(
+            invoke_clipboard_callback(&mut terminal, &[empty], full_size),
+            unsupported
+        );
+        let text = test_clipboard_content(b"text/plain", b"text");
+        let image = test_clipboard_content(b"image/png", b"image");
+        assert_eq!(
+            invoke_clipboard_callback(&mut terminal, &[text, image], full_size),
+            unsupported
+        );
+
+        let oversized = vec![b'x'; MAX_CLIPBOARD_BYTES + 1];
+        let oversized = test_clipboard_content(b"text/plain", &oversized);
+        assert_eq!(
+            invoke_clipboard_callback(&mut terminal, &[oversized], full_size),
+            invalid
+        );
+        assert_eq!(
+            invoke_clipboard_callback(&mut terminal, &[text], full_size - 1),
+            invalid
+        );
+        assert!(terminal.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn libghostty_completes_osc52_writes_for_bel_and_st_without_queries() {
+        let mut terminal = Terminal::new(10, 5, 0).unwrap();
+        terminal.write(b"\x1b]52;c;aGVs");
+        assert!(terminal.take_clipboard_writes().is_empty());
+        terminal.write(b"bG8=\x07");
+        assert_eq!(terminal.take_clipboard_writes(), vec![b"hello".to_vec()]);
+
+        terminal.write(b"\x1b]52;c;d29ybGQ=\x1b\\");
+        assert_eq!(terminal.take_clipboard_writes(), vec![b"world".to_vec()]);
+
+        terminal.write(b"\x1b]52;c;?\x07");
+        assert!(terminal.take_clipboard_writes().is_empty());
+
+        terminal.write(b"\x1b]52;c;\x07");
+        assert!(terminal.take_clipboard_writes().is_empty());
     }
 
     #[test]

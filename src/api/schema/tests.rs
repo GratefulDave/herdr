@@ -50,6 +50,7 @@ fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),
         method: Method::WorkspaceCreate(WorkspaceCreateParams {
+            source_workspace_id: None,
             cwd: Some("/tmp".into()),
             focus: true,
             label: Some("api".into()),
@@ -59,6 +60,34 @@ fn request_uses_dot_method_names() {
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "workspace.create");
+}
+
+#[test]
+fn workspace_close_group_intent_defaults_false_and_round_trips() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "close",
+        "method": "workspace.close",
+        "params": { "workspace_id": "w1" }
+    }))
+    .unwrap();
+    assert!(matches!(
+        request.method,
+        Method::WorkspaceClose(WorkspaceCloseParams {
+            close_group: false,
+            ..
+        })
+    ));
+
+    let explicit = Request {
+        id: "close-group".into(),
+        method: Method::WorkspaceClose(WorkspaceCloseParams {
+            workspace_id: "w1".into(),
+            close_group: true,
+        }),
+    };
+    let json = serde_json::to_value(&explicit).unwrap();
+    assert_eq!(json["params"]["close_group"], true);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), explicit);
 }
 
 #[test]
@@ -86,6 +115,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            wait: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -93,6 +123,32 @@ fn agent_start_and_prompt_requests_round_trip() {
     assert_eq!(
         serde_json::from_value::<Request>(prompt_json).unwrap(),
         prompt
+    );
+
+    let prompt_and_wait = Request {
+        id: "prompt-and-wait".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            wait: Some(AgentPromptWaitOptions {
+                until: vec![AgentStatus::Idle, AgentStatus::Done],
+                timeout_ms: Some(120_000),
+                submission_deadline: None,
+            }),
+        }),
+    };
+    let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
+    assert_eq!(
+        prompt_and_wait_json["params"]["wait"]["until"],
+        serde_json::json!(["idle", "done"])
+    );
+    assert_eq!(
+        prompt_and_wait_json["params"]["wait"]["timeout_ms"],
+        120_000
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
+        prompt_and_wait
     );
 }
 
@@ -219,6 +275,54 @@ fn request_round_trips_for_agent_explain() {
 }
 
 #[test]
+fn integration_list_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_integrations".into(),
+        method: Method::IntegrationList(EmptyParams::default()),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "integration.list");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+
+    let response = SuccessResponse {
+        id: "req_integrations".into(),
+        result: ResponseResult::IntegrationList {
+            integrations: vec![IntegrationInfo {
+                target: IntegrationTarget::Codex,
+                label: "codex".into(),
+                command: "codex".into(),
+                available: true,
+                state: IntegrationState::Outdated,
+            }],
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "integration_list");
+    assert_eq!(json["result"]["integrations"][0]["state"], "outdated");
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn command_invoke_request_round_trips_without_command_text() {
+    let request = Request {
+        id: "req_command".into(),
+        method: Method::CommandInvoke(CommandInvokeParams {
+            command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
+            workspace_id: Some("w1".into()),
+            tab_id: Some("w1:t1".into()),
+            pane_id: Some("w1:p1".into()),
+            selection: None,
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "command.invoke");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();
@@ -267,6 +371,49 @@ fn client_window_title_requests_round_trip() {
     assert_eq!(json["method"], "client.window_title.clear");
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, clear);
+}
+
+#[test]
+fn agent_view_requests_round_trip() {
+    let set_json = serde_json::json!({
+        "id": "view-set",
+        "method": "agent.view.set",
+        "params": {
+            "source": "example.views",
+            "label": "current + attention",
+            "filter": {
+                "op": "any",
+                "filters": [
+                    {
+                        "op": "eq",
+                        "field": "workspace_id",
+                        "value": {"context": "current_workspace_id"}
+                    },
+                    {
+                        "op": "in",
+                        "field": "status",
+                        "values": ["blocked", "done"]
+                    }
+                ]
+            },
+            "sort": [
+                {"field": "attention", "order": "desc"},
+                {"field": "state_change_seq", "order": "desc"}
+            ]
+        }
+    });
+    let request: Request = serde_json::from_value(set_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::AgentViewSet(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), set_json);
+
+    let clear_json = serde_json::json!({
+        "id": "view-clear",
+        "method": "agent.view.clear",
+        "params": {"source": "example.views"}
+    });
+    let request: Request = serde_json::from_value(clear_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::AgentViewClear(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), clear_json);
 }
 
 #[test]
@@ -343,10 +490,13 @@ fn pane_read_defaults_to_text_format() {
     "#;
 
     let request: Request = serde_json::from_str(json).unwrap();
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert!(serialized["params"].get("intent").is_none());
     let Method::PaneRead(params) = request.method else {
         panic!("wrong method parsed");
     };
     assert_eq!(params.format, ReadFormat::Text);
+    assert_eq!(params.intent, ReadIntent::Interactive);
 }
 
 #[test]
@@ -397,6 +547,14 @@ fn event_envelope_round_trips() {
             data: EventData::WorkspaceMoved {
                 workspace_id: "w_1".into(),
                 insert_index: 2,
+                workspaces: vec![],
+            },
+        },
+        EventEnvelope {
+            event: EventKind::WorkspaceReordered,
+            data: EventData::WorkspaceReordered {
+                workspace_ids: vec!["w_1".into(), "w_2".into()],
+                before_workspace_id: Some("w_3".into()),
                 workspaces: vec![],
             },
         },
@@ -551,6 +709,12 @@ fn scroll_changed_subscription_event_round_trips() {
 }
 
 #[test]
+fn agent_status_request_values_remain_strict() {
+    assert!(serde_json::from_str::<AgentStatus>(r#""working""#).is_ok());
+    assert!(serde_json::from_str::<AgentStatus>(r#""future_status""#).is_err());
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -560,6 +724,7 @@ fn success_response_round_trips() {
             capabilities: Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                endpoint_protocol_generation: Some(1),
             }),
         },
     };
@@ -612,10 +777,12 @@ fn worktree_request_and_response_round_trip() {
             branch: Some("worktree/api".into()),
             base: Some("HEAD".into()),
             focus: true,
+            trust_repository: true,
             ..WorktreeCreateParams::default()
         }),
     };
     let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"trust_repository\":true"));
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, request);
 
@@ -830,6 +997,7 @@ fn plugin_link_list_unlink_round_trip() {
             platforms: None,
             command: vec!["bun".into(), "install".into()],
         }],
+        startup: vec![],
         actions: vec![PluginManifestAction {
             id: "bootstrap".into(),
             title: "Bootstrap worktree".into(),
@@ -993,6 +1161,18 @@ fn authority_mutation_requests_round_trip() {
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, workspace_move);
 
+    let workspace_move_block = Request {
+        id: "move_ws_block".into(),
+        method: Method::WorkspaceMoveBlock(WorkspaceMoveBlockParams {
+            workspace_ids: vec!["w1".into(), "w2".into()],
+            before_workspace_id: Some("w3".into()),
+        }),
+    };
+    let json = serde_json::to_value(&workspace_move_block).unwrap();
+    assert_eq!(json["method"], "workspace.move_block");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, workspace_move_block);
+
     let tab_move = Request {
         id: "move_tab".into(),
         method: Method::TabMove(TabMoveParams {
@@ -1035,6 +1215,7 @@ fn authority_mutation_requests_round_trip() {
         method: Method::EventsSubscribe(EventsSubscribeParams {
             subscriptions: vec![
                 Subscription::WorkspaceMoved {},
+                Subscription::WorkspaceReordered {},
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
@@ -1042,6 +1223,7 @@ fn authority_mutation_requests_round_trip() {
     };
     let json = serde_json::to_string(&subscription).unwrap();
     assert!(json.contains("\"type\":\"workspace.moved\""));
+    assert!(json.contains("\"type\":\"workspace.reordered\""));
     assert!(json.contains("\"type\":\"tab.moved\""));
     assert!(json.contains("\"type\":\"layout.updated\""));
     let restored: Request = serde_json::from_str(&json).unwrap();
@@ -1136,6 +1318,32 @@ fn event_wait_parses_typed_match() {
             agent_status: AgentStatus::Done,
         }
     );
+}
+
+#[test]
+fn pane_link_activate_round_trips() {
+    let request = Request {
+        id: "req_pane_link".into(),
+        method: Method::PaneLinkActivate(PaneLinkActivateParams {
+            pane_id: "w1:p1".into(),
+            viewport_row: 3,
+            col: 7,
+            content_revision: Some(42),
+            offset_from_bottom: Some(5),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.link.activate");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    let response = ResponseResult::PaneLinkActivated {
+        url: Some("https://example.test".into()),
+        handled: false,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let restored: ResponseResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
 }
 
 #[test]

@@ -2,18 +2,25 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=5
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
-import { createConnection } from "node:net";
+import net from "node:net";
+import path from "node:path";
 
 const HERDR_ENV = process.env.HERDR_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
+const socketEndpoint =
+  process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:omp";
+// OMP marks every shell it spawns with OMPCODE=1. A nested `omp` launched from
+// a parent session's shell inherits it, so that process is not the pane's root
+// agent and must not report its short-lived session over the parent's.
+const nestedOmpSession = process.env.OMPCODE === "1";
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
 }
 
 let requestQueue = Promise.resolve();
@@ -36,7 +43,7 @@ function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolea
       resolve(delivered);
     };
 
-    const socket = createConnection(socketPath!);
+    const socket = net.createConnection(socketEndpoint!);
     socket.on("error", () => finish(false));
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
     socket.on("data", () => finish(true));
@@ -82,11 +89,17 @@ function nextReportSeq(): number {
   return reportSeq;
 }
 
+export function isAbsoluteSessionPath(file: unknown): file is string {
+  return (
+    typeof file === "string" &&
+    (path.posix.isAbsolute(file) || path.win32.isAbsolute(file))
+  );
+}
+
 function updateSessionRef(ctx: any): void {
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
-    currentAgentSessionPath =
-      typeof file === "string" && file.startsWith("/") ? file : undefined;
+    currentAgentSessionPath = isAbsoluteSessionPath(file) ? file : undefined;
   } catch {
     currentAgentSessionPath = undefined;
   }
@@ -164,29 +177,6 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
       seq,
     }),
   });
-}
-
-function releaseAgent(): Promise<void> {
-  return sendRequest({
-    id: `${source}:release:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.release_agent",
-    params: {
-      pane_id: paneId,
-      source,
-      agent: "omp",
-      seq: nextReportSeq(),
-    },
-  });
-}
-
-function shouldReleaseOnSessionShutdown(event: any): boolean {
-  // OMP tears down and rebinds extension runtimes for internal lifecycle actions
-  // such as /reload, /new, /resume, and /fork. Those do not mean the pane's
-  // agent process has exited, and releasing hook authority there can suppress
-  // legitimate reports from the replacement runtime. Only a user/process quit
-  // should release Herdr's full-lifecycle authority.
-  const reason = event?.reason;
-  return reason === "quit";
 }
 
 let sendInFlight = false;
@@ -268,6 +258,7 @@ export default function (pi) {
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let rootSession = false;
+  const activeSubagents = new Set<string>();
 
   function clearTimer(timer: ReturnType<typeof setTimeout> | undefined) {
     if (timer) {
@@ -295,7 +286,7 @@ export default function (pi) {
     if (failureBlocked) {
       return { state: "blocked" as const, message: failureMessage };
     }
-    if (agentActive || retryHoldActive) {
+    if (agentActive || retryHoldActive || activeSubagents.size > 0) {
       return { state: "working" as const, message: undefined };
     }
     return { state: "idle" as const, message: undefined };
@@ -353,6 +344,7 @@ export default function (pi) {
     agentActive = false;
     blockedCount = 0;
     blockedMessage = undefined;
+    activeSubagents.clear();
   }
 
   function activateBlocked(message: string | undefined) {
@@ -369,6 +361,46 @@ export default function (pi) {
     }
     publishState();
   }
+
+  function applySubagentLifecycle(event: any) {
+    if (!rootSession) {
+      return;
+    }
+    const id = event?.id;
+    const status = event?.status;
+    if (typeof id !== "string" || id.length === 0) {
+      return;
+    }
+    if (status === "started") {
+      activeSubagents.add(id);
+      clearTimer(idleTimer);
+      idleTimer = undefined;
+      publishState();
+      return;
+    }
+    if (status === "completed" || status === "failed" || status === "aborted") {
+      activeSubagents.delete(id);
+      if (
+        activeSubagents.size > 0 ||
+        agentActive ||
+        retryHoldActive ||
+        blockedCount > 0 ||
+        failureBlocked
+      ) {
+        publishState();
+        return;
+      }
+      scheduleIdle();
+    }
+  }
+
+  pi.events.on("task:subagent:lifecycle", (event: any) => {
+    applySubagentLifecycle(event);
+  });
+
+  pi.on("subagent_lifecycle", (event: any) => {
+    applySubagentLifecycle(event);
+  });
 
   pi.events.on("herdr:blocked", (data) => {
     if (!rootSession) {
@@ -456,6 +488,11 @@ export default function (pi) {
       // cancel the retry hold and publish a false Idle.
       return;
     }
+    if (event?.willContinue === true) {
+      // A continuation is already scheduled, so this end is not a settle.
+      // Older builds omit the field and fall through as before.
+      return;
+    }
 
     agentActive = false;
 
@@ -468,13 +505,9 @@ export default function (pi) {
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", async (event) => {
-    if (!rootSession) {
-      return;
-    }
-    clearPendingTimers();
-    if (shouldReleaseOnSessionShutdown(event)) {
-      await releaseAgent();
+  pi.on("session_shutdown", () => {
+    if (rootSession) {
+      clearPendingTimers();
     }
   });
 }

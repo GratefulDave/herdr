@@ -5,6 +5,8 @@ description: 了解 Herdr 能检测什么、智能体状态如何工作,以及�
 
 Herdr 为同时运行多个编程智能体而生。每个智能体都待在一个真实的终端窗格里,shell、日志、提示符和运行中的进程都完好无损。Herdr 跟踪哪些窗格里有智能体,把它们的状态汇总到标签页和工作区,让你直接跳到需要关注的窗格,而不是手动轮询每个终端。
 
+要从脚本或另一个智能体协调它们,请参阅[智能体自动化](/zh-cn/docs/agent-automation/)。
+
 ## 受支持的智能体
 
 常见编程智能体开箱即用地支持自动检测。重要的区别不在于 Herdr 能不能看到某个智能体,而在于允许哪个信号来决定 `idle`、`working` 和 `blocked`。
@@ -12,12 +14,13 @@ Herdr 为同时运行多个编程智能体而生。每个智能体都待在一�
 | 智能体 | 状态权威 | 集成角色 |
 | --- | --- | --- |
 | Pi | 安装后为生命周期钩子;否则为屏幕清单 | 状态与会话 |
-| OMP | 安装后为生命周期钩子 | 状态 |
+| OMP | 安装后为生命周期钩子 | 状态与会话 |
 | GitHub Copilot CLI | 屏幕清单 | 会话 |
 | Devin CLI | 屏幕清单 | 会话 |
 | Kimi Code CLI | 安装后为生命周期钩子;否则为屏幕清单 | 状态与会话 |
-| Hermes Agent | 安装后为生命周期钩子;否则为屏幕清单 | 状态与会话 |
+| Hermes Agent | 屏幕清单 | 会话 |
 | Qoder CLI | 屏幕清单 | 会话 |
+| Qwen Code | 屏幕清单 | 会话 |
 | Droid | 屏幕清单 | 会话 |
 | OpenCode | 安装后为生命周期插件;否则为屏幕清单 | 状态与会话 |
 | Kilo Code CLI | 安装后为生命周期插件;否则为屏幕清单 | 状态与会话 |
@@ -26,10 +29,11 @@ Herdr 为同时运行多个编程智能体而生。每个智能体都待在一�
 | Codex | 屏幕清单 | 会话 |
 | Cursor Agent CLI | 屏幕清单 | 会话 |
 | Amp | 屏幕清单 | 无 |
-| Grok CLI | 屏幕清单 | 无 |
-| Antigravity CLI | 屏幕清单 | 无 |
+| Grok CLI | 屏幕清单 | 会话 |
+| Antigravity CLI | 屏幕清单 | 会话 |
 | Kiro CLI | 屏幕清单 | 无 |
 | Maki | 屏幕清单 | 无 |
+| Muse | 屏幕清单 | 无 |
 
 可检测但测试较少: Gemini CLI 和 Cline。不受支持的智能体仍然可以作为普通终端进程正常运行,只是在你添加集成或通过 socket API 上报状态之前,可能得不到丰富的状态。
 
@@ -43,11 +47,13 @@ Herdr 首先检测每个窗格的前台进程。之后,每个窗格有且只有�
 
 屏幕快照来自窗格缓冲区最近的底部,而不是滚动后的视口。即使你在 Herdr 里向上翻页,检测仍然跟随底部的实时智能体 UI。
 
-Claude Code、Codex、GitHub Copilot CLI、Droid、Qoder CLI 和 Cursor Agent CLI 的集成有意不作为生命周期权威。它们为恢复提供原生会话身份,但它们的钩子并不覆盖整个生命周期,可能漏掉权限审批结果、Esc 中断或其他状态转换。对这些智能体,Herdr 仍然使用屏幕清单检测。
+上表中标为“会话”的集成有意不作为生命周期权威。它们为恢复提供原生会话身份,但它们的钩子并不覆盖整个生命周期,可能漏掉权限审批结果、Esc 中断或其他状态转换。对这些智能体,Herdr 仍然使用屏幕清单检测。
 
 ## 虚拟机与沙箱包装器
 
 在 Linux 和 macOS 上,宿主可见的包装器可能会向 Herdr 隐藏真实的智能体进程。在包装器命令上设置 `HERDR_AGENT=<agent>`,告诉 Herdr 应使用哪个已有智能体的屏幕清单。例如,在 Linux 上运行 `HERDR_AGENT=claude fence -- claude`,或在 macOS 上运行 `HERDR_AGENT=claude nono run --profile claude-code -- claude`。这个提示的作用范围只限于该前台进程;仅在 VM 或容器内部设置时 Herdr 无法看到它,而且除非所有继承的前台进程都应被视为该智能体,否则不要全局 export。
+
+某些受限的 Linux 运行环境不会公开终端前台进程组。原生检测不可用时,以 `HERDR_PROCESS_DETECTION=child-groups` 启动 Herdr 服务器,即可选择启用直接子进程组推断。原生检测仍然优先,默认的 `native` 模式不会执行此推断。这个选择加入模式属于尽力而为,较新的后台任务可能会被误判为前台任务。该变量由服务器读取且需要重启;请在远程服务器环境中设置,而不是在连接客户端上设置。
 
 ## blocked 状态
 
@@ -99,7 +105,7 @@ herdr integration install claude
 herdr integration status
 ```
 
-每个受支持的智能体都有自己的集成名称和行为。按智能体的细节和完整安装列表见[集成](/zh-cn/docs/integrations/)。
+每个受支持的智能体都有自己的集成名称和行为。按智能体的细节和完整安装列表见[集成](/zh-cn/docs/integrations/)。如果你正在构建智能体,[自定义集成指南](/zh-cn/docs/integrations/#集成你自己的智能体)介绍了如何在不为 Herdr 添加原生支持的情况下上报生命周期状态。
 
 ## 自定义智能体标签
 
@@ -110,7 +116,7 @@ herdr agent rename w1:p1 reviewer
 herdr agent rename reviewer --clear
 ```
 
-目标可以是终端 ID、唯一的智能体名称、检测到或上报的智能体标签,以及旧式窗格 ID。
+目标使用唯一的实时智能体名称,或当前承载该智能体的窗格 ID。终端 ID 和单独的智能体 kind 标签不能作为目标。
 
 ## 自定义状态标签
 
@@ -130,38 +136,6 @@ herdr pane report-metadata w1:p1 \
 `state` 控制等待、通知和汇总。`summary` 令牌只影响展示,可在智能体侧边栏行中写成 `$summary`。
 
 智能体侧边栏行也可以选择使用 `terminal_title` 或 `terminal_title_stripped`;两者都不在默认行中。前者显示经过安全规范化的最新 OSC 0/2 终端标题,后者会移除开头一个已识别的活动或旋转指示符字形及其后的空白。这些值由 Herdr 服务器所有,冷重启后不会保留,并且独立于元数据标题和语义智能体状态。因此,如果移除后的文本不变,旋转动画可以改变原始标题而不触发窗格更新。
-
-## 从 CLI 启动智能体
-
-先用工作区、标签页、窗格和布局命令创建拓扑,再把一个现有 shell 窗格启动为具有唯一名称的受支持交互式智能体:
-
-```bash
-herdr pane split --current --direction right --no-focus
-herdr agent start reviewer --kind pi --pane w1:p2
-```
-
-`agent start` 不会创建或拆分拓扑。Herdr 为请求的 kind 选择标准可执行文件,用唯一名称标记目标窗格,并等待交互式智能体被检测为 idle、done 或 blocked。原生参数可以放在 `--` 之后:
-
-```bash
-herdr agent start reviewer --kind pi --pane w1:p2 -- --name scratch --no-session
-```
-
-按名称提交提示。`--wait` 会把等待绑定到该提示,并在智能体完成或变为 blocked 时返回:
-
-```bash
-herdr agent prompt reviewer "Review the current diff" --wait --timeout 120000
-```
-
-`agent prompt` 会在发送 Enter 前遵循终端当前的 bracketed paste 模式,因此 `A != B` 之类的文本不会触发智能体的输入模式快捷键。提交提示时请使用它;`agent send` 仍是底层的字面文本操作,不会提交一轮对话。
-
-对于已经处于 working 的智能体,`agent wait` 会在状态变为 idle、done 或 blocked 时返回;如果当前已经是这些状态之一,则立即返回。
-
-```bash
-herdr agent wait reviewer --timeout 120000
-herdr agent read reviewer --source recent-unwrapped --lines 120
-```
-
-普通终端、服务器、测试、shell、拓扑和底层终端输入请使用 `herdr pane ...` 命令。
 
 ## 直接附加到智能体
 

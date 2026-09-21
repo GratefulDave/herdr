@@ -36,6 +36,17 @@ pub struct PaneTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductAnnouncementDismissParams {
+    pub version: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseNotesDismissParams {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TabTarget {
     pub tab_id: String,
 }
@@ -64,6 +75,13 @@ pub enum ReadSource {
     Recent,
     RecentUnwrapped,
     Detection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ReadIntent {
+    #[default]
+    Interactive,
+    Passive,
 }
 
 #[derive(
@@ -101,14 +119,6 @@ pub enum NotificationShowSound {
 impl NotificationShowSound {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
-    }
-
-    pub fn to_sound(self) -> Option<crate::sound::Sound> {
-        match self {
-            Self::None => None,
-            Self::Done => Some(crate::sound::Sound::Done),
-            Self::Request => Some(crate::sound::Sound::Request),
-        }
     }
 }
 
