@@ -11,6 +11,7 @@ const originalEnvironment = {
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+  OMPCODE: process.env.OMPCODE,
 };
 
 let server: Server | undefined;
@@ -88,6 +89,9 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
+  // Tests run inside an omp session inherit OMPCODE=1; the reporter must not
+  // treat the harness as a nested session.
+  delete process.env.OMPCODE;
 }
 
 function captureConnectionEndpoint() {
@@ -535,6 +539,88 @@ test("Oh My Pi keeps working when a turn ends with a scheduled continuation", as
   handlers.get("agent_end")?.({ messages: [] }, context);
   await waitFor(() => requestStates(requests).length === 3);
   expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
+});
+
+test("Oh My Pi keeps working while a subagent is still running after agent_end", async () => {
+  const requests = await startRecordingServer("omp-subagent-running");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { eventHandlers, handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = {
+    hasUI: true,
+    isIdle: () => idle,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+
+  eventHandlers.get("task:subagent:lifecycle")?.(
+    { id: "Scout", status: "started" },
+    context,
+  );
+
+  idle = true;
+  handlers.get("agent_end")?.({ messages: [] }, context);
+  await Bun.sleep(50);
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+
+  eventHandlers.get("task:subagent:lifecycle")?.(
+    { id: "Scout", status: "completed" },
+    context,
+  );
+  await waitFor(() => requestStates(requests).length === 3);
+  expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
+});
+
+test("Oh My Pi recovers to working when a subagent starts after a settled idle", async () => {
+  const requests = await startRecordingServer("omp-subagent-late-start");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { eventHandlers, handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = {
+    hasUI: true,
+    isIdle: () => idle,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  idle = true;
+  handlers.get("agent_end")?.({ messages: [] }, context);
+  await waitFor(() => requestStates(requests).length === 3);
+  expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
+
+  eventHandlers.get("task:subagent:lifecycle")?.(
+    { id: "Builder", status: "started" },
+    context,
+  );
+  await waitFor(() => requestStates(requests).length === 4);
+  expect(requestStates(requests)).toEqual(["idle", "working", "idle", "working"]);
 });
 
 test("Pi retries working state after an unanswered socket attempt", async () => {
